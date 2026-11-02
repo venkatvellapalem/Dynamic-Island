@@ -1,0 +1,128 @@
+// Spawn wrapper for the native host binary that renders the island.
+//
+// Platform routing:
+//   macOS  → island-host-bin  (Swift, Cocoa + WKWebView)
+//   Windows → island-host-win.exe  (C# WPF + WebView2)
+//
+// Both binaries speak the same stdin/stdout JSON-line protocol
+// (html, eval, close → ready, closed). This file is the only place
+// that knows which binary to spawn — everything above (companion.mjs)
+// talks to the returned FixedWindow object and never branches on OS.
+//
+// argv quirk (both platforms): --x / --y MUST be passed as two
+// separate entries (`--x 100`), not `--x=100`.
+
+import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+function resolveBinary() {
+  const here = dirname(fileURLToPath(import.meta.url));
+
+  if (process.platform === "darwin") {
+    const bin = join(here, "island-host-bin");
+    if (existsSync(bin)) return bin;
+    throw new Error(
+      "pi-island: macOS host binary not found at " + bin + "\n" +
+      "Run `npm run build` inside the pi-island directory (requires Xcode " +
+      "Command Line Tools: `xcode-select --install`)."
+    );
+  }
+
+  if (process.platform === "win32") {
+    // Framework-dependent build produces multiple files in a directory.
+    // The exe must run from that directory so it can find its DLLs.
+    const bin = join(here, "hosts", "windows", "island-host-win.exe");
+    if (existsSync(bin)) return bin;
+    throw new Error(
+      "pi-island: Windows host binary not found at " + bin + "\n" +
+      "Run `npm run build` inside the pi-island directory (requires " +
+      ".NET 8 SDK: winget install Microsoft.DotNet.SDK.8)."
+    );
+  }
+
+  throw new Error("pi-island: unsupported platform " + process.platform);
+}
+
+class FixedWindow extends EventEmitter {
+  #proc;
+  #closed = false;
+  #pending = null;
+
+  constructor(proc, html) {
+    super();
+    this.#proc = proc;
+    this.#pending = html;
+
+    proc.stdin.on("error", () => {});
+    const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
+    rl.on("line", (line) => {
+      let msg;
+      try { msg = JSON.parse(line); } catch { return; }
+      switch (msg.type) {
+        case "ready":
+          if (this.#pending) {
+            this.setHTML(this.#pending);
+            this.#pending = null;
+          } else {
+            this.emit("ready", { screen: msg.screen, appearance: msg.appearance, cursor: msg.cursor });
+          }
+          break;
+        case "message": this.emit("message", msg.data); break;
+        case "click":   this.emit("click"); break;
+        case "closed":
+          if (!this.#closed) { this.#closed = true; this.emit("closed"); }
+          break;
+      }
+    });
+    proc.on("error", (e) => this.emit("error", e));
+    proc.on("exit", () => {
+      if (!this.#closed) { this.#closed = true; this.emit("closed"); }
+    });
+  }
+
+  #write(obj) {
+    if (this.#closed) return;
+    try {
+      // Escape all non-ASCII to \uXXXX so the stdin pipe carries only
+      // ASCII bytes. Fixes Turkish/Unicode corruption on Windows where
+      // the pipe encoding may not be UTF-8.
+      const json = JSON.stringify(obj).replace(/[\u0080-\uffff]/g,
+        (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+      this.#proc.stdin.write(json + "\n");
+    } catch {}
+  }
+
+  send(js)        { this.#write({ type: "eval", js }); }
+  setHTML(html)   { this.#write({ type: "html", html: Buffer.from(html).toString("base64") }); }
+  close()         { this.#write({ type: "close" }); }
+}
+
+export function openFixed(html, options = {}) {
+  const bin = resolveBinary();
+  const args = [];
+
+  if (options.width  != null) args.push("--width",  String(options.width));
+  if (options.height != null) args.push("--height", String(options.height));
+  if (options.title  != null) args.push("--title",  options.title);
+
+  if (options.frameless)    args.push("--frameless");
+  if (options.floating)     args.push("--floating");
+  if (options.transparent)  args.push("--transparent");
+  if (options.clickThrough) args.push("--click-through");
+  if (options.noDock)       args.push("--no-dock");
+  if (options.hidden)       args.push("--hidden");
+
+  // THE FIX: Swift parses --x / --y as TWO args, not --x=N.
+  if (options.x != null) args.push("--x", String(options.x));
+  if (options.y != null) args.push("--y", String(options.y));
+
+  // stderr: "inherit" on macOS (useful for Swift logs), "ignore" on Windows
+  // (WebView2 spams harmless GPU errors that would flash a console).
+  const stderr = process.platform === "win32" ? "ignore" : "inherit";
+  const proc = spawn(bin, args, { stdio: ["pipe", "pipe", stderr], windowsHide: true });
+  return new FixedWindow(proc, html);
+}

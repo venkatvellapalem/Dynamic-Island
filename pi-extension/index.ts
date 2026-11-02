@@ -1,0 +1,767 @@
+/**
+ * pi-island — pi extension (socket client).
+ *
+ * Each pi instance running this extension connects to a shared companion
+ * daemon over a Unix socket and streams its session's status updates.
+ * The companion owns the single Dynamic-Island WebView window and stacks
+ * all active sessions as rows — so running `pi` in two terminals at the
+ * same time shows TWO rows, etc.
+ *
+ * If the companion isn't running, we spawn it (detached) and retry the
+ * connection. The companion shuts itself down 6s after the last client
+ * disconnects.
+ */
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, SettingsList, type SettingItem } from "@earendil-works/pi-tui";
+import { connect, type Socket } from "node:net";
+import { spawn, execSync } from "node:child_process";
+import { basename, join, dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { SOCK } from "./socket-path.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const COMPANION = join(HERE, "companion.mjs");
+const SESSION_ID = randomUUID().slice(0, 8);
+
+// Version the extension is running at — shipped to the companion in the
+// `hello` handshake. If the companion reports a different version we
+// assume state may be corrupt (pre-0.2.1 ghost-row bug, protocol drift)
+// and auto-heal by respawning it. See `versionHandshake()` below.
+function readExtensionVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch { return "0.0.0"; }
+}
+const EXTENSION_VERSION = readExtensionVersion();
+
+// ── Persistent user preference ─────────────────────────────────────────────
+// Every user-visible setting that survives restarts lives in ~/.pi/pi-island.json.
+// Fields are all optional in the on-disk file — missing ones fall back to
+// sensible defaults so old installs keep working on upgrade.
+//
+//   {
+//     "enabled":   true,            // visibility toggle
+//     "scale":     "medium",        // size preset
+//     "screen":    "primary",       // which display
+//     "notchMode": "auto"           // notch-wrap policy
+//   }
+//
+// The companion reads the same file at spawn time for settings it owns
+// (screen + notch). Settings that change live (size, visibility) are
+// delivered over the socket as well.
+const PREF_DIR  = join(homedir(), ".pi");
+const PREF_FILE = join(PREF_DIR, "pi-island.json");
+
+// Scale presets — mirrors SCALES in island.html.mjs. Adding a preset
+// requires updates in BOTH files (the list here drives the settings
+// menu / validation; the map over there drives the actual CSS scale).
+const SCALES = ["small", "medium", "large", "xlarge"] as const;
+type Scale = typeof SCALES[number];
+const DEFAULT_SCALE: Scale = "medium";
+
+// Screen preference:
+//   "primary" → NSScreen.screens[0] (menu-bar screen, AGENT.md §6.1 original)
+//   "active"  → screen under the mouse cursor at companion spawn (PR #3)
+//   "2"..."N" → specific monitor by index (1 == primary, so the menu hides it)
+type ScreenPref = string;
+const DEFAULT_SCREEN: ScreenPref = "primary";
+
+// Notch wrap policy:
+//   "auto"   → companion auto-detects via safeAreaInsets (default, pre-0.2 behaviour)
+//   "normal" → force disable (useful if auto-detection misfires)
+//   "notch"  → force enable (replaces the removed /island2 command)
+const NOTCH_MODES = ["auto", "normal", "notch"] as const;
+type NotchMode = typeof NOTCH_MODES[number];
+const DEFAULT_NOTCH: NotchMode = "auto";
+
+type Preference = {
+  enabled:     boolean;
+  scale:       Scale;
+  screen:      ScreenPref;
+  notchMode:   NotchMode;
+  // Version of pi-island that last wrote this file. Used to fire a
+  // one-time welcome notify after `npm update` so the user knows the
+  // upgrade happened (and that state was auto-healed if needed).
+  lastVersion?: string;
+};
+
+function isScale(v: unknown): v is Scale {
+  return typeof v === "string" && (SCALES as readonly string[]).includes(v);
+}
+function isNotchMode(v: unknown): v is NotchMode {
+  return typeof v === "string" && (NOTCH_MODES as readonly string[]).includes(v);
+}
+// "primary" | "active" | "1" | "2" | ... — numeric must be a clean integer ≥ 1.
+function isScreen(v: unknown): v is ScreenPref {
+  if (typeof v !== "string") return false;
+  if (v === "primary" || v === "active") return true;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 1 && String(n) === v;
+}
+
+function readPreference(): Preference {
+  const fallback: Preference = {
+    enabled:   true,
+    scale:     DEFAULT_SCALE,
+    screen:    DEFAULT_SCREEN,
+    notchMode: DEFAULT_NOTCH,
+  };
+  try {
+    if (!existsSync(PREF_FILE)) return fallback;
+    const data = JSON.parse(readFileSync(PREF_FILE, "utf8"));
+    return {
+      enabled:     data?.enabled   !== false,
+      scale:       isScale(data?.scale)          ? data.scale     : DEFAULT_SCALE,
+      screen:      isScreen(data?.screen)        ? data.screen    : DEFAULT_SCREEN,
+      notchMode:   isNotchMode(data?.notchMode)  ? data.notchMode : DEFAULT_NOTCH,
+      lastVersion: typeof data?.lastVersion === "string" ? data.lastVersion : undefined,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function writePreference(p: Preference): void {
+  try {
+    if (!existsSync(PREF_DIR)) mkdirSync(PREF_DIR, { recursive: true });
+    writeFileSync(PREF_FILE, JSON.stringify(p, null, 2) + "\n");
+  } catch { /* best-effort — don't crash the session over a cache file */ }
+}
+
+// Screen count — delegated to platform.mjs so it works on macOS and Windows.
+// Dynamic import because index.ts is the extension entry point and
+// platform.mjs is an .mjs file (pure ESM).
+let _platformGetScreenCount: (() => number) | null = null;
+async function getScreenCount(): Promise<number> {
+  try {
+    if (!_platformGetScreenCount) {
+      const mod = await import("./platform.mjs");
+      _platformGetScreenCount = mod.getScreenCount;
+    }
+    return _platformGetScreenCount();
+  } catch { return 1; }
+}
+
+// ── tool name → island state (matches pi's built-in tool set) ──────────────
+interface IslandUpdate {
+  status: string;
+  detail?: string;
+}
+function toolToIsland(toolName: string, args: any): IslandUpdate {
+  const a = args ?? {};
+  switch (toolName) {
+    case "read":  return { status: "reading", detail: basename(a.path ?? "") };
+    case "edit":  return { status: "editing", detail: basename(a.path ?? "") };
+    case "write": return { status: "writing", detail: basename(a.path ?? "") };
+    case "bash": {
+      const cmd = String(a.command ?? "");
+      const first = cmd.split(/\s+/)[0] || "bash";
+      return { status: "running", detail: first };
+    }
+    case "ls":    return { status: "searching", detail: basename(a.path ?? "") || "." };
+    case "grep":  return { status: "searching", detail: String(a.pattern ?? "") };
+    case "find":  return { status: "searching", detail: String(a.pattern ?? a.path ?? "") };
+    default:      return { status: "running",   detail: toolName };
+  }
+}
+
+function truncatePrompt(s: string, max = 48): string {
+  const clean = String(s || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
+}
+
+// Project names come from `basename(process.cwd())` — usually short
+// (`pi-island`, `my-app`) but occasionally pathological. Clamp at the
+// source so the socket never ships 200-char strings; CSS adds a second
+// ellipsis safety net in case this ever regresses.
+function truncateProject(s: string, max = 20): string {
+  const clean = String(s || "");
+  if (!clean) return "";
+  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
+}
+
+// ── extension entry ────────────────────────────────────────────────────────
+export default function (pi: ExtensionAPI) {
+  if (process.platform !== "darwin" && process.platform !== "win32") return;
+
+  // ── Client state ─────────────────────────────────────────────────────────
+  let sock: Socket | null = null;
+  let connecting = false;
+  const pref = readPreference();
+  let shownForSession    = pref.enabled;
+  let currentScale:     Scale      = pref.scale;
+  let currentScreen:    ScreenPref = pref.screen;
+  let currentNotchMode: NotchMode  = pref.notchMode;
+  let hideTimer: NodeJS.Timeout | null = null;
+
+  const project = truncateProject(basename(process.cwd()));
+  let lastCtx: any = null;
+  let activeToolCount = 0;
+  let inAgent = false;
+  let currentPrompt = "";
+  let startedAt: number | null = null;
+  let frozenElapsed: number | null = null;
+
+  function persistPref() {
+    writePreference({
+      enabled:     shownForSession,
+      scale:       currentScale,
+      screen:      currentScreen,
+      notchMode:   currentNotchMode,
+      lastVersion: EXTENSION_VERSION,
+    });
+  }
+
+  // ── Socket connection ────────────────────────────────────────────────────
+  function connectToCompanion(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const s = connect(SOCK);
+      let settled = false;
+      const done = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (ok) { sock = s; sock.on("close", () => { sock = null; }); sock.on("error", () => {}); }
+        resolve(ok);
+      };
+      s.once("connect", () => done(true));
+      s.once("error",   () => done(false));
+    });
+  }
+
+  // Auto-heal: ask the companion "what version are you?" and if it
+  // disagrees with us (or doesn't answer — pre-0.2.1 companions have no
+  // `hello` handler) treat it as stale and force a respawn. This is what
+  // lets a user `npm update` and see ghost rows disappear without ever
+  // running `/island reload` or `pkill` manually.
+  //
+  // Returns true if the current companion is compatible (same version);
+  // false if the caller should forceRespawn() and reconnect.
+  function versionHandshake(): Promise<boolean> {
+    const s = sock;
+    if (!s || s.destroyed) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let buf = "";
+      let done = false;
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        s.off("data", onData);
+        resolve(ok);
+      };
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          try {
+            const msg = JSON.parse(line);
+            if (msg && msg.type === "hello-ack") {
+              finish(typeof msg.version === "string" && msg.version === EXTENSION_VERSION);
+              return;
+            }
+          } catch { /* not our line, ignore */ }
+          nl = buf.indexOf("\n");
+        }
+      };
+      s.on("data", onData);
+      try {
+        s.write(JSON.stringify({
+          id: SESSION_ID,
+          type: "hello",
+          version: EXTENSION_VERSION,
+        }) + "\n");
+      } catch {
+        finish(false);
+        return;
+      }
+      // Generous timeout — pre-0.2.1 companions never reply, and we want
+      // to respawn them. A legit companion responds in <10ms on localhost.
+      setTimeout(() => finish(false), 1000);
+    });
+  }
+
+  // Force the companion to exit regardless of protocol support. Polite
+  // first (respawn message for v0.2.1+ companions), then a hard pkill
+  // so pre-0.2.1 companions — which don't understand `respawn` — die
+  // too. Also cleans up the socket file in case the old process crashed
+  // without removing it. Safe to call even when no companion is running.
+  async function forceRespawn(): Promise<void> {
+    if (sock && !sock.destroyed) {
+      // Clean up any ghost row the old companion may have created from our
+      // `hello` message (pre-0.2.1 treated unknown types as upserts).
+      try { writeMessage({ id: SESSION_ID, type: "remove" }); } catch {}
+      try { writeMessage({ id: SESSION_ID, type: "respawn" }); } catch {}
+      try { sock.end(); } catch {}
+      sock = null;
+    }
+    try {
+      if (process.platform === "win32") {
+        execSync('taskkill /F /FI "COMMANDLINE eq *pi-island*companion.mjs*"', {
+          timeout: 1000,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } else {
+        execSync("pkill -f pi-island/pi-extension/companion.mjs", {
+          timeout: 1000,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      }
+    } catch { /* no matching process */ }
+    // Unix sockets leave a file on disk; named pipes (Windows) auto-clean.
+    if (process.platform !== "win32") {
+      try { if (existsSync(SOCK)) unlinkSync(SOCK); } catch {}
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  // Tell the companion the client's current visual scale. Pushed on every
+  // fresh connect so a freshly-spawned companion (medium by default) picks
+  // up the user's pref without waiting for an explicit size change.
+  function syncScale() {
+    writeMessage({ id: SESSION_ID, type: "scale", scale: currentScale });
+  }
+
+  async function ensureConnection(): Promise<boolean> {
+    if (sock && !sock.destroyed) return true;
+    if (connecting) return false;
+    connecting = true;
+    try {
+      // Try connecting to an existing companion first.
+      if (existsSync(SOCK) && await connectToCompanion()) {
+        // Auto-heal: verify the running companion matches our version.
+        // If it doesn't (or doesn't respond to hello — pre-0.2.1), kill
+        // it and spawn a fresh one. This is the "user ran npm update but
+        // ghost rows stick around" fix.
+        if (await versionHandshake()) {
+          syncScale();
+          return true;
+        }
+        await forceRespawn();
+        // Fall through to the spawn path below.
+      }
+
+      // Otherwise spawn the companion and poll until the socket is up.
+      if (!existsSync(COMPANION)) return false;
+      const child = spawn(process.execPath, [COMPANION], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        if (await connectToCompanion()) {
+          // We spawned this companion ourselves, so versions match by
+          // construction — but still do the handshake as a sanity check
+          // (catches the "wrong binary on PATH" failure mode).
+          if (await versionHandshake()) {
+            syncScale();
+            return true;
+          }
+          // If even a freshly-spawned companion disagrees, give up
+          // rather than looping. Something is badly wrong.
+          return false;
+        }
+      }
+      return false;
+    } finally {
+      connecting = false;
+    }
+  }
+
+  function writeMessage(msg: any) {
+    if (!sock || sock.destroyed) return;
+    try { sock.write(JSON.stringify(msg) + "\n"); } catch { /* pipe might be closed */ }
+  }
+
+  async function sendUpdate(status: string, detail = "", opts: { resetTimer?: boolean } = {}) {
+    if (!shownForSession) return;
+    if (!sock) { if (!(await ensureConnection())) return; }
+    if (opts.resetTimer || startedAt == null) {
+      startedAt = Date.now();
+      frozenElapsed = null;
+    }
+    let ctxPct: number | null = null;
+    try {
+      const usage = lastCtx?.getContextUsage?.();
+      if (usage && usage.percent != null) ctxPct = Math.round(usage.percent);
+    } catch {}
+    writeMessage({
+      id: SESSION_ID,
+      type: "update",
+      project,
+      status,
+      detail,
+      prompt: currentPrompt,
+      startedAt,
+      frozenElapsed,
+      ctxPct,
+    });
+  }
+
+  async function sendRemove() {
+    if (!sock) return;
+    writeMessage({ id: SESSION_ID, type: "remove" });
+  }
+
+  // Ask the companion to cleanly exit so the client's next event respawns
+  // it with fresh pref values. Used for settings that need a new NSWindow
+  // (screen position, notch mode) — NSWindow geometry is fixed after spawn.
+  async function respawnCompanion() {
+    if (sock && !sock.destroyed) {
+      writeMessage({ id: SESSION_ID, type: "respawn" });
+      try { sock.end(); } catch {}
+      sock = null;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (shownForSession) await ensureConnection();
+  }
+
+  // User-facing reset — nukes the companion (and with it any ghost rows)
+  // and lets the next event spawn a clean one. Exposed via `/island reload`.
+  // Uses forceRespawn() because the caller likely reached for this exactly
+  // when polite `respawn` isn't enough (stale state, pre-0.2.1 companion).
+  async function reloadCompanion(ctx: any) {
+    await forceRespawn();
+    if (shownForSession) await ensureConnection();
+    ctx.ui.notify("Island reloaded — state reset", "info");
+  }
+
+  // One-time welcome notice after `npm update`. Fires on the first
+  // session of a newly-installed version and updates `lastVersion` in
+  // the pref file so it doesn't nag on subsequent sessions.
+  function maybeShowUpgradeNotice(ctx: any) {
+    if (pref.lastVersion === EXTENSION_VERSION) return;
+    // First session ever (no lastVersion) — don't nag new users.
+    const isFirstEver = !pref.lastVersion;
+    persistPref();  // writes lastVersion = EXTENSION_VERSION
+    if (isFirstEver) return;
+    try {
+      ctx.ui.notify(
+        `pi-island updated to ${EXTENSION_VERSION}. Try /island for settings.`,
+        "info",
+      );
+    } catch { /* best-effort — don't crash a session over a toast */ }
+  }
+
+  // ── Setting actions (shared between /island subcommands and the menu) ────
+  async function doEnable(ctx: any) {
+    shownForSession = true;
+    persistPref();
+    await ensureConnection();
+    ctx.ui.notify("Island enabled", "info");
+  }
+
+  async function doDisable(ctx: any) {
+    shownForSession = false;
+    persistPref();
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    await sendRemove();
+    ctx.ui.notify("Island disabled", "info");
+  }
+
+  async function doSetScale(next: Scale, ctx: any) {
+    currentScale = next;
+    persistPref();
+    // Scale is live — no companion respawn needed. CSS var flips instantly.
+    if (sock && !sock.destroyed) {
+      syncScale();
+    } else if (shownForSession) {
+      if (await ensureConnection()) syncScale();
+    }
+    ctx.ui.notify(`Island size → ${next}`, "info");
+  }
+
+  async function doSetScreen(next: ScreenPref, ctx: any) {
+    currentScreen = next;
+    persistPref();
+    await respawnCompanion();
+    ctx.ui.notify(`Island screen → ${next}`, "info");
+  }
+
+  async function doSetNotchMode(next: NotchMode, ctx: any) {
+    currentNotchMode = next;
+    persistPref();
+    await respawnCompanion();
+    ctx.ui.notify(`Island notch wrap → ${next}`, "info");
+  }
+
+  // ── Settings menu — same UX as pi's /settings ────────────────────────────
+  // Uses pi-tui's SettingsList component via ctx.ui.custom(). Each row
+  // shows a label + current value; Enter/Space cycles through `values`.
+  // The action callbacks are the same helpers the /island subcommands use,
+  // so menu and CLI stay perfectly in sync.
+  //
+  // IMPORTANT pattern notes (learned the hard way):
+  //   - Do NOT pass { overlay: true }. It puts us in a narrow floating box
+  //     that bleeds terminal scrollback through the transparent areas
+  //     (rendering garbage). Full-width in-flow render — same layout as
+  //     pi's own /settings — needs no options at all.
+  //   - The factory MUST return an object with explicit render/invalidate/
+  //     handleInput — NOT the Container directly. Container doesn't route
+  //     keystrokes to its active focusable child, so the list would never
+  //     see Enter/Space/arrows and the terminal looks frozen.
+  //   - handleInput must call tui.requestRender() after each keystroke or
+  //     the cycled value doesn't repaint until the next unrelated event.
+  async function openSettingsMenu(ctx: any) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(
+        "Settings menu needs an interactive UI. Try /island size|screen|notch <value>",
+        "info",
+      );
+      return;
+    }
+
+    const screenCount = await getScreenCount();
+    const screenValues: string[] = ["primary", "active"];
+    for (let i = 2; i <= screenCount; i++) screenValues.push(String(i));
+
+    await ctx.ui.custom<void>((tui: any, theme: any, _kb: any, done: (r?: void) => void) => {
+      const items: SettingItem[] = [
+          {
+            id: "visibility",
+            label: "Visibility",
+            description: "Show or hide the Dynamic Island capsule at the top of the screen",
+            currentValue: shownForSession ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "size",
+            label: "Size",
+            description: "Font size / row height preset (live — no restart needed)",
+            currentValue: currentScale,
+            values: [...SCALES],
+          },
+          {
+            id: "screen",
+            label: "Screen",
+            description: "Display to host the capsule (primary = menu-bar screen; active = follow mouse; 2/3/… = monitor index)",
+            currentValue: currentScreen,
+            values: screenValues,
+          },
+          {
+            id: "notch",
+            label: "Notch wrap",
+            description: "Wrap the MacBook notch (auto = detect; normal = force off; notch = force on)",
+            currentValue: currentNotchMode,
+            values: [...NOTCH_MODES],
+          },
+        ];
+
+      const container = new Container();
+      const border = () => new DynamicBorder((s: string) => theme.fg("accent", s));
+      container.addChild(border());
+
+      const list = new SettingsList(
+        items,
+        10,
+        getSettingsListTheme(),
+        (id: string, newValue: string) => {
+          // Fire-and-forget — SettingsList doesn't await us. Any failure
+          // just leaves the displayed value updated but the real setting
+          // unchanged. In practice all our do*() helpers are robust.
+          (async () => {
+            if (id === "visibility") {
+              if (newValue === "enabled") await doEnable(ctx);
+              else await doDisable(ctx);
+            } else if (id === "size" && isScale(newValue)) {
+              await doSetScale(newValue, ctx);
+            } else if (id === "screen" && isScreen(newValue)) {
+              await doSetScreen(newValue, ctx);
+            } else if (id === "notch" && isNotchMode(newValue)) {
+              await doSetNotchMode(newValue, ctx);
+            }
+          })();
+          list.updateValue(id, newValue);
+        },
+        () => done(undefined),
+        { enableSearch: false },
+      );
+      container.addChild(list);
+      container.addChild(border());
+
+      // Explicit Component-shaped return so keystrokes actually reach the
+      // SettingsList (Container alone swallows them). See header comment.
+      return {
+        render(width: number) { return container.render(width); },
+        invalidate()            { container.invalidate(); },
+        handleInput(data: string) {
+          list.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    });
+  }
+
+  // ── Event handlers ───────────────────────────────────────────────────────
+  pi.on("session_start", async (_evt, ctx) => {
+    lastCtx = ctx;
+    // Don't auto-show on session start — the island appears on the first
+    // agent_start event (when there's actually something to show).
+    maybeShowUpgradeNotice(ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (hideTimer) clearTimeout(hideTimer);
+    await sendRemove();
+    try { sock?.end(); } catch {}
+    sock = null;
+  });
+
+  pi.on("before_agent_start", async (evt: any, ctx) => {
+    lastCtx = ctx;
+    currentPrompt = truncatePrompt(evt?.prompt ?? "", 48);
+  });
+
+  pi.on("agent_start", async (_evt, ctx) => {
+    lastCtx = ctx;
+    inAgent = true;
+    activeToolCount = 0;
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    await sendUpdate("thinking", "", { resetTimer: true });
+  });
+
+  pi.on("message_update", async (_evt, ctx) => {
+    lastCtx = ctx;
+    if (activeToolCount === 0 && inAgent) {
+      await sendUpdate("thinking", "");
+    }
+  });
+
+  pi.on("tool_execution_start", async (evt, ctx) => {
+    lastCtx = ctx;
+    activeToolCount++;
+    const upd = toolToIsland(evt.toolName, (evt as any).args);
+    await sendUpdate(upd.status, upd.detail ?? "");
+  });
+
+  pi.on("tool_execution_end", async (evt, ctx) => {
+    lastCtx = ctx;
+    activeToolCount = Math.max(0, activeToolCount - 1);
+    if ((evt as any).isError) {
+      await sendUpdate("error", (evt as any).toolName);
+      setTimeout(async () => {
+        if (inAgent && activeToolCount === 0) await sendUpdate("thinking", "");
+      }, 1500);
+      return;
+    }
+    if (activeToolCount === 0 && inAgent) {
+      await sendUpdate("thinking", "");
+    }
+  });
+
+  pi.on("agent_end", async (_evt, ctx) => {
+    lastCtx = ctx;
+    inAgent = false;
+    if (startedAt != null) frozenElapsed = Date.now() - startedAt;
+    await sendUpdate("done", "");
+    // Retract the row 5s after done so the user can read the summary.
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(async () => { await sendRemove(); }, 5000);
+  });
+
+  // ── /island command ──────────────────────────────────────────────────────
+  //
+  //   /island                   → open settings menu (canonical)
+  //   /island on | enable       → show + persist
+  //   /island off | disable     → hide + persist
+  //   /island toggle            → flip current visibility
+  //   /island size <preset>     → set scale (small | medium | large)
+  //   /island screen <value>    → set screen (primary | active | 2 | 3 ...)
+  //   /island notch <mode>      → set notch wrap (auto | normal | notch)
+  //
+  // Subcommands let power users / scripts skip the menu. With no args the
+  // menu is the friendlier path — same UX as pi's own /settings.
+  pi.registerCommand("island", {
+    description: "Open pi-island settings (or /island size|screen|notch <value>)",
+    handler: async (args, ctx) => {
+      const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
+        await openSettingsMenu(ctx);
+        return;
+      }
+      const sub = parts[0]?.toLowerCase();
+
+      if (sub === "on" || sub === "enable") { await doEnable(ctx);  return; }
+      if (sub === "off" || sub === "disable") { await doDisable(ctx); return; }
+      if (sub === "toggle") {
+        if (shownForSession) await doDisable(ctx); else await doEnable(ctx);
+        return;
+      }
+      if (sub === "reload" || sub === "reset") {
+        await reloadCompanion(ctx);
+        return;
+      }
+
+      if (sub === "size") {
+        const next = parts[1]?.toLowerCase();
+        if (!next) {
+          ctx.ui.notify(`Size: ${currentScale} — try /island size <${SCALES.join("|")}>`, "info");
+          return;
+        }
+        if (!isScale(next)) {
+          ctx.ui.notify(`Unknown size "${next}". Use one of: ${SCALES.join(", ")}`, "error");
+          return;
+        }
+        await doSetScale(next, ctx);
+        return;
+      }
+
+      if (sub === "screen") {
+        const next = parts[1]?.toLowerCase();
+        if (!next) {
+          ctx.ui.notify(
+            `Screen: ${currentScreen} — try /island screen <primary|active|2|3|...>`,
+            "info",
+          );
+          return;
+        }
+        if (!isScreen(next)) {
+          ctx.ui.notify(
+            `Unknown screen "${next}". Use: primary, active, or a monitor index (1..N)`,
+            "error",
+          );
+          return;
+        }
+        await doSetScreen(next, ctx);
+        return;
+      }
+
+      if (sub === "notch") {
+        const next = parts[1]?.toLowerCase();
+        if (!next) {
+          ctx.ui.notify(
+            `Notch wrap: ${currentNotchMode} — try /island notch <${NOTCH_MODES.join("|")}>`,
+            "info",
+          );
+          return;
+        }
+        if (!isNotchMode(next)) {
+          ctx.ui.notify(
+            `Unknown notch mode "${next}". Use one of: ${NOTCH_MODES.join(", ")}`,
+            "error",
+          );
+          return;
+        }
+        await doSetNotchMode(next, ctx);
+        return;
+      }
+
+      ctx.ui.notify(
+        `Unknown subcommand "${sub}". Try: /island (menu)  or  /island size|screen|notch|reload <value>`,
+        "error",
+      );
+    },
+  });
+}

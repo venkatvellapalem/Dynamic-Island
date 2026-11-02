@@ -1,0 +1,40 @@
+name: Publish to npm
+
+# Triggered on version tags: v0.3.0, v0.3.0-beta.1, etc.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # Compile the macOS host binary (postinstall does this normally,
+      # but CI verifies the Swift source compiles cleanly).
+      - run: npm install
+
+      # Determine npm tag: beta/alpha tags publish to their own channel,
+      # everything else goes to "latest".
+      - id: npm-tag
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == *"beta"* ]]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" == *"alpha"* ]]; then
+            echo "tag=alpha" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: |
+          echo "Publishing with npm tag: ${{ steps.npm-tag.outputs.tag }}"
+          npm publish --access public --tag ${{ steps.npm-tag.outputs.tag }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

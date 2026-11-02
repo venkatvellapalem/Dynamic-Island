@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+// pi-island companion daemon
+// ----------------------------
+// Single long-lived process per user that:
+//   1. Owns the one native WebView window (top of primary screen).
+//   2. Runs a Unix socket server at ~/.pi/pi-island.sock.
+//   3. Accepts JSON-line messages from every pi extension client and
+//      renders each connected session as its own row in the stack.
+//
+// Protocol (client → server, one JSON object per line):
+//   { "id": "<session-uuid>", "type": "update",
+//     "project": "...", "status": "thinking", "detail": "...",
+//     "prompt": "...", "ctxPct": 34, "frozenElapsed": <ms>|null }
+//   { "id": "<session-uuid>", "type": "remove" }
+//   { "id": "<session-uuid>", "type": "mode",    "mode":  "normal"|"notch" }
+//   { "id": "<session-uuid>", "type": "scale",   "scale": "small"|"medium"|"large" }
+//   { "id": "<session-uuid>", "type": "respawn" }
+//   { "id": "<session-uuid>", "type": "hello",   "version": "0.2.1" }
+//
+// Server → client (only for version handshake, one JSON object per line):
+//   { "type": "hello-ack", "version": "0.2.1" }
+//
+// Unknown message types are IGNORED (not upserted). This is a deliberate
+// break from pre-0.2.1 companions which treated the default branch as an
+// upsert — older clients sending unknown types produced empty "ghost"
+// rows. Every concrete type is dispatched explicitly now.
+//
+// On startup the companion also reads ~/.pi/pi-island.json for settings it
+// owns (screen, notchMode). Clients bump those via the `respawn` message
+// after updating the pref file — NSWindow geometry is fixed at spawn so a
+// live screen change requires a fresh process.
+//
+// When the last client disconnects we keep the window for 6s so a quick
+// reconnect (pi /new, /reload, etc.) doesn't flash the capsule closed,
+// then exit cleanly.
+
+import { createServer } from "node:net";
+import { createInterface } from "node:readline";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { openFixed } from "./open-fixed.mjs";
+import { buildIslandHTML } from "./island.html.mjs";
+import { SOCK } from "./socket-path.mjs";
+import { getScreenGeometry, computeWindowPosition, resolveNotchMode, dpiScaleOf } from "./platform.mjs";
+
+// ---- Version handshake ----------------------------------------------------
+// Used by the client so it can notice a version mismatch (e.g. user ran
+// `npm i pi-island` but we're still alive in-memory from the previous
+// version) and trigger a self-respawn. See `versionHandshake` / auto-heal
+// in pi-extension/index.ts.
+const HERE = dirname(fileURLToPath(import.meta.url));
+function readCompanionVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch { return "0.0.0"; }
+}
+const COMPANION_VERSION = readCompanionVersion();
+
+// ---- Status vocabulary ----------------------------------------------------
+// Must stay in sync with the STATUS table in island.html.mjs and the
+// toolToIsland map in index.ts. Updates with any other value are dropped
+// at the companion boundary so malformed / version-mismatched clients
+// can't leak empty "ghost" rows into the WebView. See AGENT.md §5.
+const VALID_STATUS = new Set([
+  "thinking", "reading", "editing", "writing",
+  "running",  "searching", "done",    "error",
+]);
+
+// ---- User preference --------------------------------------------------
+// Small subset of ~/.pi/pi-island.json that this process cares about.
+// The client-side extension owns the full schema; we only read the two
+// fields that drive geometry (screen + notchMode) and silently ignore
+// the rest so old/new formats coexist.
+const PREF_FILE = join(homedir(), ".pi", "pi-island.json");
+
+function readPref() {
+  try {
+    if (!existsSync(PREF_FILE)) return {};
+    const data = JSON.parse(readFileSync(PREF_FILE, "utf8"));
+    return data && typeof data === "object" ? data : {};
+  } catch { return {}; }
+}
+
+// ---- Window setup ---------------------------------------------------------
+// Tall enough to fit several stacked rows without ever needing a resize
+// (the host window can't be resized after spawn). The extra vertical area
+// is transparent + clickThrough so it doesn't affect anything.
+//
+// IMPORTANT: WebView2 rasterises CSS pixels at the monitor DPI, so on a
+// scaled display these must be PHYSICAL pixels. A flat 640x420 on a 200%
+// screen left the 460px CSS row needing 920px of a 640px window -> clipped.
+const _pref = readPref();
+const SCREEN_PREF =
+  typeof _pref.screen === "string" && _pref.screen.length > 0
+    ? _pref.screen
+    : "primary";
+const NOTCH_PREF =
+  _pref.notchMode === "normal" || _pref.notchMode === "notch"
+    ? _pref.notchMode
+    : "auto";
+
+const screenGeo = getScreenGeometry(SCREEN_PREF);
+const DPI = dpiScaleOf(screenGeo);
+const WIN_W = Math.round(560 * DPI);
+const WIN_H = Math.round(240 * DPI); // capsule + expansion + a few stacked sessions
+const { x, y } = computeWindowPosition(screenGeo, WIN_W, WIN_H);
+const autoMode = resolveNotchMode(NOTCH_PREF, screenGeo.notch);
+
+const win = openFixed(buildIslandHTML(), {
+  width: WIN_W, height: WIN_H, x, y,
+  frameless: true, floating: true, transparent: true,
+  // MUST stay false: a click-through window never receives mouse events, so
+  // hover-to-expand is impossible. The magenta TransparencyKey already makes
+  // the empty canvas pass clicks through at the OS level, so nothing is lost.
+  clickThrough: false, noDock: true,
+});
+
+let winReady = false;
+const pending = [];
+function send(js) {
+  if (winReady) try { win.send(js); } catch {}
+  else pending.push(js);
+}
+
+win.on("ready", () => {
+  winReady = true;
+  send(`window.island.setMode(${JSON.stringify(autoMode)})`);
+  for (const js of pending.splice(0)) win.send(js);
+});
+win.on("closed", () => { cleanup(); process.exit(0); });
+win.on("error", () => { /* keep running; the host may emit harmless errors */ });
+
+// ---- Socket server --------------------------------------------------------
+// Unix sockets leave a file on disk that must be cleaned up before
+// re-listening. Named pipes (Windows) are kernel objects — no cleanup
+// needed, and unlinkSync would throw on a pipe path anyway.
+if (process.platform !== "win32" && existsSync(SOCK)) {
+  try { unlinkSync(SOCK); } catch {}
+}
+
+const clients = new Set();
+// Per-socket id tracker — every distinct `id` we've ever seen on this
+// socket. On disconnect we issue `removeRow` for ALL of them, not just
+// the last one. Fixes the "Single socket carries multiple session IDs"
+// limitation documented in the pre-0.2.1 AGENT.md §14.
+const socketIds = new WeakMap();
+let idleTimer = null;
+
+function scheduleIdleExit() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (clients.size === 0) {
+      cleanup();
+      process.exit(0);
+    }
+  }, 6000);
+}
+
+const server = createServer((sock) => {
+  clients.add(sock);
+  socketIds.set(sock, new Set());
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+
+  const rl = createInterface({ input: sock, crlfDelay: Infinity });
+
+  rl.on("line", (line) => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
+    // Track every distinct id seen on this socket for cleanup on close.
+    if (typeof msg.id === "string" && msg.id) {
+      socketIds.get(sock)?.add(msg.id);
+    }
+
+    // ── Explicit dispatch — no default-upsert ─────────────────────────────
+    // Pre-0.2.1 companions treated anything with an id as an upsert. That
+    // turned protocol-mismatched messages (e.g. a new client sending
+    // `type:"scale"` to an old companion) into empty ghost rows. We now
+    // dispatch by exact type and silently ignore anything we don't know.
+
+    if (msg.type === "hello") {
+      // Version handshake — client uses this to detect a version mismatch
+      // and trigger a self-respawn. We just reply with our own version;
+      // the client decides whether to respawn us.
+      try {
+        sock.write(JSON.stringify({
+          type: "hello-ack",
+          version: COMPANION_VERSION,
+        }) + "\n");
+      } catch {}
+      return;
+    }
+
+    if (msg.type === "update") {
+      // Require a valid status — empty / unknown statuses are dropped at
+      // the boundary so malformed clients can't create ghost rows.
+      if (!msg.id || !VALID_STATUS.has(msg.status)) return;
+      send(`window.island.upsertRow(${JSON.stringify(msg.id)},${JSON.stringify(msg)})`);
+      return;
+    }
+
+    if (msg.type === "remove") {
+      if (!msg.id) return;
+      send(`window.island.removeRow(${JSON.stringify(msg.id)})`);
+      return;
+    }
+
+    if (msg.type === "mode" && (msg.mode === "normal" || msg.mode === "notch")) {
+      send(`window.island.setMode(${JSON.stringify(msg.mode)})`);
+      return;
+    }
+
+    if (msg.type === "scale" && typeof msg.scale === "string") {
+      // WebView clamps unknown scales to medium — we don't need to validate
+      // here, just forward. This keeps the companion agnostic to the preset
+      // list so new sizes can land in index.ts + island.html.mjs without a
+      // companion change.
+      send(`window.island.setScale(${JSON.stringify(msg.scale)})`);
+      return;
+    }
+
+    if (msg.type === "respawn") {
+      // Graceful shutdown so the client's next ensureConnection() spawns
+      // a fresh companion that re-reads the pref file (new screen / notch)
+      // or runs the newly-installed code (auto-heal after `npm update`).
+      cleanup();
+      process.exit(0);
+      return;
+    }
+
+    // Unknown type — ignore. No row created.
+  });
+
+  sock.on("close", () => {
+    clients.delete(sock);
+    const ids = socketIds.get(sock);
+    if (ids) {
+      for (const id of ids) send(`window.island.removeRow(${JSON.stringify(id)})`);
+      socketIds.delete(sock);
+    }
+    if (clients.size === 0) scheduleIdleExit();
+  });
+  sock.on("error", () => {});
+});
+
+server.on("error", (err) => {
+  // Another companion is already running. Exit silently — the extension
+  // will just connect to the existing one.
+  if (err && err.code === "EADDRINUSE") {
+    cleanup();
+    process.exit(0);
+  }
+});
+
+server.listen(SOCK, () => { /* ready */ });
+
+// ---- Cleanup --------------------------------------------------------------
+let cleaned = false;
+function cleanup() {
+  if (cleaned) return;
+  cleaned = true;
+  try { server.close(); } catch {}
+  if (process.platform !== "win32") { try { if (existsSync(SOCK)) unlinkSync(SOCK); } catch {} }
+  try { win.close(); } catch {}
+}
+process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+process.on("SIGINT",  () => { cleanup(); process.exit(0); });
+process.on("exit", cleanup);

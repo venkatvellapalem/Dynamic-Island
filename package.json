@@ -1,0 +1,79 @@
+{
+  "name": "pi-island",
+  "version": "0.3.0",
+  "description": "Dynamic-Island-style status capsule for the pi coding agent on macOS and Windows. Shows what pi is doing in real time, at the very top of your screen — with native notch-wrap support for MacBooks.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "macos",
+    "windows",
+    "cross-platform",
+    "dynamic-island",
+    "notch",
+    "status-bar",
+    "agent-ui",
+    "webkit",
+    "wkwebview",
+    "webview2"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extension/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "postinstall": "node scripts/postinstall.mjs",
+    "demo": "node pi-extension/demo.mjs",
+    "demo:single": "node pi-extension/demo.mjs single",
+    "dev:link": "npm link && node scripts/dev-status.mjs",
+    "dev:unlink": "npm unlink -g pi-island && npm i -g pi-island && node scripts/dev-status.mjs",
+    "dev:status": "node scripts/dev-status.mjs",
+    "pack:test": "node scripts/pack-test.mjs",
+    "release:beta": "node scripts/bump-version.mjs beta && git add -A && git commit -m 'chore: release v'$(node -p \"require('./package.json').version\") && git tag v$(node -p \"require('./package.json').version\") && git push --follow-tags && echo 'beta tag pushed -- CI will publish to npm with --tag beta'",
+    "release:patch": "npm version patch -m 'chore: release v%s' && git push --follow-tags && echo '✓ tag pushed — GitHub Actions (.github/workflows/publish.yml) will publish to npm'",
+    "release:minor": "npm version minor -m 'chore: release v%s' && git push --follow-tags && echo '✓ tag pushed — GitHub Actions (.github/workflows/publish.yml) will publish to npm'",
+    "release:major": "npm version major -m 'chore: release v%s' && git push --follow-tags && echo '✓ tag pushed — GitHub Actions (.github/workflows/publish.yml) will publish to npm'"
+  },
+  "files": [
+    "pi-extension/index.ts",
+    "pi-extension/island.html.mjs",
+    "pi-extension/open-fixed.mjs",
+    "pi-extension/companion.mjs",
+    "pi-extension/socket-path.mjs",
+    "pi-extension/platform.mjs",
+    "pi-extension/island-host.swift",
+    "pi-extension/demo.mjs",
+    "hosts/windows/island-host.cs",
+    "hosts/windows/island-host.csproj",
+    "hosts/windows/NuGet.config",
+    "hosts/macos/island-host.swift",
+    "scripts/build.mjs",
+    "scripts/postinstall.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "win32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phun333/pi-island.git"
+  },
+  "bugs": {
+    "url": "https://github.com/phun333/pi-island/issues"
+  },
+  "homepage": "https://github.com/phun333/pi-island#readme",
+  "author": "phun333",
+  "license": "MIT"
+}
